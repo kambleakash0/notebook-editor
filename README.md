@@ -2,6 +2,12 @@
 
 A Model Context Protocol (MCP) server for editing Jupyter notebooks (`.ipynb`) with **cell-level primitives** and **kernel execution**. Provides 23 native tools for working with notebooks the way data scientists actually use them: cells as first-class citizens, outputs and execution state as managed data, and a real Jupyter kernel (whichever one the notebook's kernelspec names: Python, R, Julia, ...) for running code and capturing results.
 
+<p align="center">
+  <a href="https://glama.ai/mcp/servers/kambleakash0/notebook-editor">
+    <img src="https://glama.ai/mcp/servers/kambleakash0/notebook-editor/badges/card.svg" alt="notebook-editor MCP server" />
+  </a>
+</p>
+
 ## Why a cell-native server?
 
 Jupyter notebooks are structured JSON containers with cells, outputs, execution state, and metadata — not flat source files. A notebook-specific server can model this correctly:
