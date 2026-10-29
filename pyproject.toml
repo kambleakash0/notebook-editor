@@ -1,0 +1,33 @@
+[project]
+name = "notebook-editor-mcp"
+version = "1.2.4"
+description = "MCP Server for editing Jupyter notebooks (.ipynb) with cell-level operations and kernel execution"
+requires-python = ">=3.10"
+dependencies = [
+    "mcp>=2.0.0,<3.0.0",
+    "nbformat>=5.10.0",
+    "jupyter-client>=8.6.0",
+    "ipykernel>=6.29.0",
+    "pydantic>=2.12.0",
+]
+authors = [{ name = "Akash Kamble", email = "kambleakash0@gmail.com" }]
+license = { text = "MIT" }
+readme = "README.md"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project.scripts]
+notebook-editor-mcp = "notebook_editor.server:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["notebook_editor"]
+
+[tool.uv]
+exclude-newer = "7 days"
+
+[project.urls]
+Homepage = "https://github.com/kambleakash0/notebook-editor"
+Repository = "https://github.com/kambleakash0/notebook-editor"
+Issues = "https://github.com/kambleakash0/notebook-editor/issues"

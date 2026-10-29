@@ -1,0 +1,37 @@
+{
+  "$schema": "https://glama.ai/mcp/schemas/server.json",
+  "maintainers": [
+    "kambleakash0"
+  ],
+  "name": "notebook-editor",
+  "description": "Jupyter notebook (.ipynb) editing MCP server with 23 tools to create, read, search and restructure notebooks cell by cell, manage outputs and metadata, and execute cells on a live Jupyter kernel (python3 built in; R, Julia and others via their installed kernels), built on nbformat and jupyter_client — replaces brittle raw-JSON edits with cell-level notebook operations.",
+  "keywords": [
+    "notebook-editor",
+    "mcp",
+    "mcp-server",
+    "model-context-protocol",
+    "jupyter",
+    "jupyter-notebook",
+    "ipynb",
+    "notebook",
+    "nbformat",
+    "jupyter-client",
+    "ipykernel",
+    "jupyter-kernel",
+    "kernel-execution",
+    "code-execution",
+    "cell-editing",
+    "notebook-automation",
+    "data-science",
+    "python",
+    "r",
+    "julia",
+    "llm-tools",
+    "ai-coding",
+    "agent-tools",
+    "claude-code",
+    "developer-tools",
+    "notebook-editing",
+    "kernel-agnostic"
+  ]
+}

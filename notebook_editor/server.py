@@ -1,0 +1,844 @@
+"""
+Notebook Editor MCP Server -- cell-level operations for Jupyter .ipynb files.
+"""
+import logging
+import os
+from importlib.metadata import PackageNotFoundError, version as _pkg_version
+from typing import Annotated
+
+from mcp.server import MCPServer
+from mcp.types import ToolAnnotations
+from pydantic import Field
+
+from notebook_editor.manager import NotebookManager, NotebookManagerError, create_notebook as _create_notebook
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger("notebook-editor")
+
+# Condensed version of NOTEBOOK-EDITOR.md, sent to clients as MCP server instructions
+_INSTRUCTIONS = (
+    "Cell-level tools for creating, editing, and executing Jupyter .ipynb notebooks. "
+    "Use them instead of generic file edit or write tools for .ipynb files, and pass "
+    "absolute file paths. "
+    "Start with list_cells to see cell indices, types, and previews; use get_cell to "
+    "read one cell, find_in_notebook for text search, and list_notebook_symbols for "
+    "Python symbols (Python notebooks only). "
+    "Create notebooks with create_notebook; never hand-write notebook JSON. "
+    "Pick the narrowest edit: add_cell for a new cell (index -1 appends), "
+    "prepend_to_cell or append_to_cell to add lines, replace_cell_source only to "
+    "rewrite a whole cell, and move_cell, split_cell, merge_cells, or delete_cell to "
+    "restructure. "
+    "Indices are zero-based and shift after adds, deletes, splits, and merges, so "
+    "re-run list_cells instead of guessing. "
+    "Run code with execute_cell (returns the cell's outputs) or execute_all_cells; "
+    "markdown and raw cells cannot be executed, and get_outputs reads stored outputs. "
+    "Kernels: one per notebook, started lazily on first execution using "
+    "metadata.kernelspec.name (any installed Jupyter kernel), in the notebook's "
+    "folder so relative paths resolve there. State persists across calls; use "
+    "interrupt_kernel to stop a stuck cell, restart_kernel for a clean namespace, "
+    "and shutdown_kernel to release resources. A cell that runs past its timeout "
+    "is interrupted with the kernel's state kept; if the error says the kernel is "
+    "still busy, use restart_kernel."
+)
+
+
+def _server_version() -> str:
+    try:
+        return _pkg_version("notebook-editor-mcp")
+    except PackageNotFoundError:
+        return "0.0.0"
+
+
+mcp = MCPServer("Notebook-Editor", instructions=_INSTRUCTIONS, version=_server_version())
+
+# Tool behavior hints. Destructive covers anything that can discard cell content,
+# outputs, metadata, an existing file, or in-memory kernel state.
+_READ_ONLY = ToolAnnotations(read_only_hint=True, destructive_hint=False, open_world_hint=False)
+_ADDITIVE = ToolAnnotations(read_only_hint=False, destructive_hint=False, open_world_hint=False)
+_DESTRUCTIVE = ToolAnnotations(read_only_hint=False, destructive_hint=True, open_world_hint=False)
+_RUNS_CODE = ToolAnnotations(read_only_hint=False, destructive_hint=True, open_world_hint=True)
+
+# Shared parameter types; the descriptions end up in each tool's inputSchema
+FilePath = Annotated[str, Field(description="Absolute path to an existing .ipynb notebook file.")]
+CellIndex = Annotated[int, Field(description="Zero-based index of the cell, as shown by list_cells.")]
+
+
+def _validate_file(file_path: str) -> str | None:
+    """Return an error string if file_path is invalid, else None."""
+    if not os.path.isabs(file_path):
+        return f"file_path must be an absolute path, got: {file_path}"
+    if not os.path.isfile(file_path):
+        return f"File not found: {file_path}"
+    if not file_path.endswith(".ipynb"):
+        return f"File is not a .ipynb notebook: {file_path}"
+    return None
+
+
+# ──────────────────────────────────────────────
+# Cell structure & navigation
+# ──────────────────────────────────────────────
+
+@mcp.tool(annotations=_READ_ONLY)
+def list_cells(file_path: FilePath) -> str:
+    """
+    Return a formatted outline of all cells in a Jupyter notebook: index, type
+    (code/markdown/raw), line count, execution count (if any), and a preview of
+    the first line.
+
+    Use this when: You're starting work on an unfamiliar notebook and want to see
+    its structure at a glance. Always a good first call.
+    Don't use this when: You need actual code symbols (functions/classes) -- use
+    `list_notebook_symbols` instead.
+
+    Example:
+        file_path="/abs/path/to/notebook.ipynb"
+    """
+    if err := _validate_file(file_path):
+        return err
+    try:
+        logger.info("list_cells: file='%s'", file_path)
+        return NotebookManager(file_path).list_cells()
+    except NotebookManagerError as e:
+        logger.warning("list_cells: %s", e)
+        return f"Cannot list cells: {e}"
+    except Exception as e:
+        logger.exception("list_cells crashed")
+        return f"Internal error in list_cells: {type(e).__name__}: {e}"
+
+
+@mcp.tool(annotations=_READ_ONLY)
+def get_cell(file_path: FilePath, index: CellIndex) -> str:
+    """
+    Return the source text of a specific cell.
+
+    Use this when: You need to read the exact contents of a cell (to reason about
+    it before editing, or to display it to the user).
+    Don't use this when: You need the whole notebook's structure -- use `list_cells`.
+
+    Example:
+        file_path="/abs/path/to/notebook.ipynb"
+        index=3
+    """
+    if err := _validate_file(file_path):
+        return err
+    try:
+        logger.info("get_cell: file='%s' index=%d", file_path, index)
+        return NotebookManager(file_path).get_cell(index)
+    except NotebookManagerError as e:
+        logger.warning("get_cell: %s", e)
+        return f"Cannot get cell: {e}"
+    except Exception as e:
+        logger.exception("get_cell crashed")
+        return f"Internal error in get_cell: {type(e).__name__}: {e}"
+
+
+@mcp.tool(annotations=_ADDITIVE)
+def add_cell(
+    file_path: FilePath,
+    index: Annotated[int, Field(description="Zero-based position for the new cell; -1 or the current cell count appends at the end.")],
+    source: Annotated[str, Field(description="Source text of the new cell; empty by default.")] = "",
+    cell_type: Annotated[str, Field(description="Type of the new cell: 'code' (default), 'markdown', or 'raw'.")] = "code",
+) -> str:
+    """
+    Insert a new cell at the given index, shifting existing cells down. Default
+    cell_type is 'code'. Pass -1 for index to append at the end of the notebook.
+
+    Use this when: You need to add a new code cell, markdown explanation, or raw
+    cell at a specific position.
+    Don't use this when: You want to replace an existing cell's source -> use
+    `replace_cell_source`. You want to merge content into an existing cell -> use
+    `prepend_to_cell`/`append_to_cell`.
+
+    Example:
+        index=2
+        source="import pandas as pd\\ndf = pd.read_csv('data.csv')"
+        cell_type="code"    # default; other options: "markdown", "raw"
+    """
+    if err := _validate_file(file_path):
+        return err
+    try:
+        logger.info("add_cell: file='%s' index=%d type=%s", file_path, index, cell_type)
+        mgr = NotebookManager(file_path)
+        mgr.add_cell(index, source, cell_type)
+        return "Added"
+    except NotebookManagerError as e:
+        logger.warning("add_cell: %s", e)
+        return f"Cannot add cell: {e}"
+    except Exception as e:
+        logger.exception("add_cell crashed")
+        return f"Internal error in add_cell: {type(e).__name__}: {e}"
+
+
+@mcp.tool(annotations=_DESTRUCTIVE)
+def delete_cell(file_path: FilePath, index: CellIndex) -> str:
+    """
+    Remove the cell at the given index, shifting subsequent cells up.
+
+    Use this when: You want to remove an entire cell (obsolete code, outdated
+    markdown).
+    Don't use this when: You want to clear a cell's outputs but keep the code ->
+    use `clear_outputs`.
+
+    Example:
+        index=5
+    """
+    if err := _validate_file(file_path):
+        return err
+    try:
+        logger.info("delete_cell: file='%s' index=%d", file_path, index)
+        mgr = NotebookManager(file_path)
+        mgr.delete_cell(index)
+        return "Deleted"
+    except NotebookManagerError as e:
+        logger.warning("delete_cell: %s", e)
+        return f"Cannot delete cell: {e}"
+    except Exception as e:
+        logger.exception("delete_cell crashed")
+        return f"Internal error in delete_cell: {type(e).__name__}: {e}"
+
+
+@mcp.tool(annotations=_ADDITIVE)
+def move_cell(
+    file_path: FilePath,
+    from_index: Annotated[int, Field(description="Zero-based index of the cell to move.")],
+    to_index: Annotated[int, Field(description="Zero-based index the cell ends up at; must be an existing cell index.")],
+) -> str:
+    """
+    Move a cell from one index to another. Other cells shift to accommodate.
+
+    Use this when: You want to reorder cells (e.g., move imports to the top, move
+    a helper function above its caller).
+
+    Example:
+        from_index=4
+        to_index=1
+    """
+    if err := _validate_file(file_path):
+        return err
+    try:
+        logger.info("move_cell: file='%s' from=%d to=%d", file_path, from_index, to_index)
+        mgr = NotebookManager(file_path)
+        mgr.move_cell(from_index, to_index)
+        return "Moved"
+    except NotebookManagerError as e:
+        logger.warning("move_cell: %s", e)
+        return f"Cannot move cell: {e}"
+    except Exception as e:
+        logger.exception("move_cell crashed")
+        return f"Internal error in move_cell: {type(e).__name__}: {e}"
+
+
+@mcp.tool(annotations=_DESTRUCTIVE)
+def split_cell(
+    file_path: FilePath,
+    index: CellIndex,
+    line_offset: Annotated[int, Field(description="Zero-based line where the new cell starts, from 0 to the cell's line count; the original cell keeps the lines before it.")],
+) -> str:
+    """
+    Split one cell into two at a line boundary. The first cell keeps lines
+    [0:line_offset], and a new cell of the same type is inserted after with the
+    rest. Outputs are cleared on both halves since the code has changed.
+
+    Use this when: A cell has grown too large and should be broken into logical
+    sections, or you want to insert a markdown cell in the middle of existing code.
+
+    Example:
+        index=3
+        line_offset=10    # first cell keeps lines 0-9, new cell gets line 10 onwards
+    """
+    if err := _validate_file(file_path):
+        return err
+    try:
+        logger.info("split_cell: file='%s' index=%d line_offset=%d", file_path, index, line_offset)
+        mgr = NotebookManager(file_path)
+        mgr.split_cell(index, line_offset)
+        return "Split"
+    except NotebookManagerError as e:
+        logger.warning("split_cell: %s", e)
+        return f"Cannot split cell: {e}"
+    except Exception as e:
+        logger.exception("split_cell crashed")
+        return f"Internal error in split_cell: {type(e).__name__}: {e}"
+
+
+@mcp.tool(annotations=_DESTRUCTIVE)
+def merge_cells(
+    file_path: FilePath,
+    start_index: Annotated[int, Field(description="Zero-based index of the first cell to merge.")],
+    end_index: Annotated[int, Field(description="Zero-based index of the last cell to merge (inclusive); must be greater than start_index.")],
+) -> str:
+    """
+    Merge consecutive cells [start_index..end_index] (inclusive) into one. All
+    cells in the range must be the same type (can't mix code and markdown).
+    Outputs are cleared on the merged result.
+
+    Use this when: Multiple small cells logically belong together.
+    Don't use this when: The cells have different types -> move them or split them
+    into a common type first.
+
+    Example:
+        start_index=2
+        end_index=4    # merges cells 2, 3, and 4 into a single cell at index 2
+    """
+    if err := _validate_file(file_path):
+        return err
+    try:
+        logger.info("merge_cells: file='%s' start=%d end=%d", file_path, start_index, end_index)
+        mgr = NotebookManager(file_path)
+        mgr.merge_cells(start_index, end_index)
+        return "Merged"
+    except NotebookManagerError as e:
+        logger.warning("merge_cells: %s", e)
+        return f"Cannot merge cells: {e}"
+    except Exception as e:
+        logger.exception("merge_cells crashed")
+        return f"Internal error in merge_cells: {type(e).__name__}: {e}"
+
+
+# ──────────────────────────────────────────────
+# Cell content editing
+# ──────────────────────────────────────────────
+
+@mcp.tool(annotations=_DESTRUCTIVE)
+def replace_cell_source(
+    file_path: FilePath,
+    index: CellIndex,
+    new_source: Annotated[str, Field(description="Source text that replaces the cell's entire current source.")],
+) -> str:
+    """
+    Replace the entire source text of a cell. Clears outputs and execution_count
+    if the cell is a code cell.
+
+    Use this when: You're rewriting a cell's content top-to-bottom.
+    Don't use this when: You only need to add lines -> use `prepend_to_cell` or
+    `append_to_cell`. You need AST-level Python edits within a cell -> convert
+    to a .py file via jupytext, edit with ast-editor, convert back.
+
+    Example:
+        index=2
+        new_source="import pandas as pd\\ndf = pd.read_parquet('data.parquet')"
+    """
+    if err := _validate_file(file_path):
+        return err
+    try:
+        logger.info("replace_cell_source: file='%s' index=%d", file_path, index)
+        mgr = NotebookManager(file_path)
+        mgr.replace_cell_source(index, new_source)
+        return "Updated"
+    except NotebookManagerError as e:
+        logger.warning("replace_cell_source: %s", e)
+        return f"Cannot replace cell source: {e}"
+    except Exception as e:
+        logger.exception("replace_cell_source crashed")
+        return f"Internal error in replace_cell_source: {type(e).__name__}: {e}"
+
+
+@mcp.tool(annotations=_DESTRUCTIVE)
+def prepend_to_cell(
+    file_path: FilePath,
+    index: CellIndex,
+    source: Annotated[str, Field(description="Text to insert at the top of the cell; a newline is added before the existing source if needed.")],
+) -> str:
+    """
+    Prepend source text to the top of a cell. Clears outputs if it's a code cell.
+
+    Use this when: You need to add setup code, imports, or preamble lines to the
+    beginning of an existing cell.
+    Don't use this when: You're replacing the whole cell -> use `replace_cell_source`.
+
+    Example:
+        index=3
+        source="import numpy as np"
+    """
+    if err := _validate_file(file_path):
+        return err
+    try:
+        logger.info("prepend_to_cell: file='%s' index=%d", file_path, index)
+        mgr = NotebookManager(file_path)
+        mgr.prepend_to_cell(index, source)
+        return "Added"
+    except NotebookManagerError as e:
+        logger.warning("prepend_to_cell: %s", e)
+        return f"Cannot prepend to cell: {e}"
+    except Exception as e:
+        logger.exception("prepend_to_cell crashed")
+        return f"Internal error in prepend_to_cell: {type(e).__name__}: {e}"
+
+
+@mcp.tool(annotations=_DESTRUCTIVE)
+def append_to_cell(
+    file_path: FilePath,
+    index: CellIndex,
+    source: Annotated[str, Field(description="Text to add at the bottom of the cell; a newline is added after the existing source if needed.")],
+) -> str:
+    """
+    Append source text to the bottom of a cell. Clears outputs if it's a code cell.
+
+    Use this when: You need to add follow-up code, assertions, or logging to the
+    end of an existing cell.
+    Don't use this when: You're replacing the whole cell -> use `replace_cell_source`.
+
+    Example:
+        index=3
+        source="print(df.shape)"
+    """
+    if err := _validate_file(file_path):
+        return err
+    try:
+        logger.info("append_to_cell: file='%s' index=%d", file_path, index)
+        mgr = NotebookManager(file_path)
+        mgr.append_to_cell(index, source)
+        return "Added"
+    except NotebookManagerError as e:
+        logger.warning("append_to_cell: %s", e)
+        return f"Cannot append to cell: {e}"
+    except Exception as e:
+        logger.exception("append_to_cell crashed")
+        return f"Internal error in append_to_cell: {type(e).__name__}: {e}"
+
+
+# ──────────────────────────────────────────────
+# Outputs & metadata
+# ──────────────────────────────────────────────
+
+@mcp.tool(annotations=_DESTRUCTIVE)
+def clear_outputs(
+    file_path: FilePath,
+    index: Annotated[int, Field(description="Zero-based index of the code cell to clear; -1 (default) clears every code cell.")] = -1,
+) -> str:
+    """
+    Clear outputs and execution_count of a specific code cell, or of ALL code
+    cells if index is -1 (default). Markdown/raw cells are untouched.
+
+    Use this when: You want to clean up stale outputs before committing the
+    notebook, or reset outputs before re-running cells.
+
+    Example:
+        index=-1    # clear all code cells (default)
+        index=3     # clear only cell 3
+    """
+    if err := _validate_file(file_path):
+        return err
+    try:
+        logger.info("clear_outputs: file='%s' index=%d", file_path, index)
+        mgr = NotebookManager(file_path)
+        mgr.clear_outputs(None if index == -1 else index)
+        return "Cleared"
+    except NotebookManagerError as e:
+        logger.warning("clear_outputs: %s", e)
+        return f"Cannot clear outputs: {e}"
+    except Exception as e:
+        logger.exception("clear_outputs crashed")
+        return f"Internal error in clear_outputs: {type(e).__name__}: {e}"
+
+
+@mcp.tool(annotations=_DESTRUCTIVE)
+def clear_execution_counts(file_path: FilePath) -> str:
+    """
+    Reset execution_count to None on all code cells across the notebook. Outputs
+    are preserved -- only the execution numbering is reset.
+
+    Use this when: You want to remove the `In [3]:` / `Out [7]:` numbering noise
+    (e.g., before committing to git) without losing the actual output data.
+
+    Example:
+        file_path="/abs/path/to/notebook.ipynb"
+    """
+    if err := _validate_file(file_path):
+        return err
+    try:
+        logger.info("clear_execution_counts: file='%s'", file_path)
+        mgr = NotebookManager(file_path)
+        mgr.clear_execution_counts()
+        return "Cleared"
+    except NotebookManagerError as e:
+        logger.warning("clear_execution_counts: %s", e)
+        return f"Cannot clear execution counts: {e}"
+    except Exception as e:
+        logger.exception("clear_execution_counts crashed")
+        return f"Internal error in clear_execution_counts: {type(e).__name__}: {e}"
+
+
+@mcp.tool(annotations=_READ_ONLY)
+def get_outputs(file_path: FilePath, index: CellIndex) -> str:
+    """
+    Return a formatted text representation of a code cell's outputs. Handles
+    stream (stdout/stderr), execute_result, display_data, and error output types.
+    ANSI escape codes (colors) are removed from this text; the notebook file
+    keeps them.
+
+    Use this when: You need to see what a cell produced (e.g., to interpret an
+    error or verify a result).
+    Don't use this when: The cell isn't a code cell -> the tool will tell you so.
+
+    Example:
+        index=3
+    """
+    if err := _validate_file(file_path):
+        return err
+    try:
+        logger.info("get_outputs: file='%s' index=%d", file_path, index)
+        return NotebookManager(file_path).get_outputs(index)
+    except NotebookManagerError as e:
+        logger.warning("get_outputs: %s", e)
+        return f"Cannot get outputs: {e}"
+    except Exception as e:
+        logger.exception("get_outputs crashed")
+        return f"Internal error in get_outputs: {type(e).__name__}: {e}"
+
+
+@mcp.tool(annotations=_DESTRUCTIVE)
+def set_cell_metadata(
+    file_path: FilePath,
+    index: CellIndex,
+    key: Annotated[str, Field(description="Cell metadata key to set; an existing value under this key is overwritten.")],
+    value: Annotated[str, Field(description="Value as a JSON string (for example 'true', '42', or '[\"parameters\"]'); stored as a plain string if it is not valid JSON.")],
+) -> str:
+    """
+    Set a metadata key on a specific cell. The value is parsed as JSON (so you
+    can pass booleans, numbers, nested objects). Falls back to string if parsing
+    fails.
+
+    Use this when: You need to tag a cell with Jupyter metadata (e.g., `collapsed`,
+    `tags`, `scrolled`, papermill parameters).
+
+    Example:
+        index=0
+        key="tags"
+        value='["parameters"]'    # JSON array
+        # or
+        key="collapsed"
+        value="true"               # JSON boolean
+    """
+    if err := _validate_file(file_path):
+        return err
+    try:
+        logger.info("set_cell_metadata: file='%s' index=%d key='%s'", file_path, index, key)
+        mgr = NotebookManager(file_path)
+        mgr.set_cell_metadata(index, key, value)
+        return "Updated"
+    except NotebookManagerError as e:
+        logger.warning("set_cell_metadata: %s", e)
+        return f"Cannot set metadata: {e}"
+    except Exception as e:
+        logger.exception("set_cell_metadata crashed")
+        return f"Internal error in set_cell_metadata: {type(e).__name__}: {e}"
+
+
+# ──────────────────────────────────────────────
+# Discovery (read-only)
+# ──────────────────────────────────────────────
+
+@mcp.tool(annotations=_READ_ONLY)
+def list_notebook_symbols(file_path: FilePath) -> str:
+    """
+    Walk all code cells and list Python symbols (functions, classes, methods,
+    top-level assignments, imports) with their cell index and line number. Uses
+    Python's stdlib `ast` module so it works only for Python code cells.
+
+    Use this when: You want a notebook-wide view of defined functions and classes
+    (e.g., "where is `train_model` defined?"). Complements `list_cells` which
+    shows only cell-level structure.
+
+    Example:
+        file_path="/abs/path/to/notebook.ipynb"
+    """
+    if err := _validate_file(file_path):
+        return err
+    try:
+        logger.info("list_notebook_symbols: file='%s'", file_path)
+        return NotebookManager(file_path).list_notebook_symbols()
+    except NotebookManagerError as e:
+        logger.warning("list_notebook_symbols: %s", e)
+        return f"Cannot list notebook symbols: {e}"
+    except Exception as e:
+        logger.exception("list_notebook_symbols crashed")
+        return f"Internal error in list_notebook_symbols: {type(e).__name__}: {e}"
+
+
+@mcp.tool(annotations=_READ_ONLY)
+def find_in_notebook(
+    file_path: FilePath,
+    pattern: Annotated[str, Field(description="Case-sensitive substring to search for in every cell's source (not a regex).")],
+) -> str:
+    """
+    Search for a text pattern across all cell sources. Returns each match as
+    `cell[i] line N (cell_type): <text>`. Case-sensitive substring match -- no
+    regex. Searches code, markdown, and raw cells.
+
+    Use this when: You need a quick text search across the whole notebook (e.g.,
+    to find a variable name or a TODO marker).
+    Don't use this when: You need scoped symbol search -> use `list_notebook_symbols`.
+
+    Example:
+        pattern="train_model"
+    """
+    if err := _validate_file(file_path):
+        return err
+    try:
+        logger.info("find_in_notebook: file='%s' pattern='%s'", file_path, pattern)
+        return NotebookManager(file_path).find_in_notebook(pattern)
+    except NotebookManagerError as e:
+        logger.warning("find_in_notebook: %s", e)
+        return f"Cannot search notebook: {e}"
+    except Exception as e:
+        logger.exception("find_in_notebook crashed")
+        return f"Internal error in find_in_notebook: {type(e).__name__}: {e}"
+
+
+# ──────────────────────────────────────────────
+# Kernel execution (Phase 2)
+# ──────────────────────────────────────────────
+
+@mcp.tool(annotations=_RUNS_CODE)
+def execute_cell(
+    file_path: FilePath,
+    index: Annotated[int, Field(description="Zero-based index of the code cell to run; markdown and raw cells are rejected.")],
+    timeout: Annotated[float, Field(gt=0, description="Maximum seconds the cell may run (default 60; must be positive); a cell still running then is interrupted and an error is returned, with the kernel's state kept.")] = 60.0,
+) -> str:
+    """
+    Execute a single code cell using the notebook's Jupyter kernel (named by
+    metadata.kernelspec.name, so any installed kernel works, not just Python).
+    Captures outputs (stdout, results, errors, display data) and writes them back
+    to the notebook file along with the execution_count. The kernel is started
+    lazily on first execute, in the notebook's folder (relative paths resolve
+    there), and kept alive for the server's lifetime. A cell that runs past
+    `timeout` is interrupted (as interrupt_kernel does) so the kernel is free for
+    the next call. Concurrent executions on one notebook run one at a time, and
+    outputs are written into the file as it is when the cell finishes.
+
+    Use this when: You want to run a specific cell and capture its output.
+    Don't use this when: The cell isn't a code cell (markdown/raw cannot execute).
+    You want to run the whole notebook -> use `execute_all_cells`.
+
+    Example:
+        index=3
+        timeout=60.0    # seconds; default is 60
+    """
+    if err := _validate_file(file_path):
+        return err
+    try:
+        logger.info("execute_cell: file='%s' index=%d", file_path, index)
+        mgr = NotebookManager(file_path)
+        mgr.execute_cell(index, timeout=timeout)
+        # Report the outputs captured
+        return f"Successfully executed cell {index}.\n\n" + mgr.get_outputs(index)
+    except NotebookManagerError as e:
+        logger.warning("execute_cell: %s", e)
+        return f"Cannot execute cell: {e}"
+    except Exception as e:
+        logger.exception("execute_cell crashed")
+        return f"Internal error in execute_cell: {type(e).__name__}: {e}"
+
+
+@mcp.tool(annotations=_RUNS_CODE)
+def execute_all_cells(
+    file_path: FilePath,
+    timeout: Annotated[float, Field(gt=0, description="Maximum seconds each cell may run (default 60; must be positive); a cell still running then is interrupted and the run stops with an error.")] = 60.0,
+    stop_on_error: Annotated[bool, Field(description="Stop at the first cell that raises an error (default true); false runs the remaining cells too.")] = True,
+) -> str:
+    """
+    Execute all code cells in the notebook in order, updating outputs and
+    execution_count on each. Markdown/raw cells and empty code cells are skipped.
+    By default, execution stops at the first cell that raises an error.
+
+    Use this when: You're running a full notebook top-to-bottom (e.g., for
+    regeneration, CI, or batch re-execution).
+    Don't use this when: You only need one cell -> use `execute_cell`.
+
+    Example:
+        timeout=60.0
+        stop_on_error=true    # default; set to false to continue past errors
+    """
+    if err := _validate_file(file_path):
+        return err
+    try:
+        logger.info("execute_all_cells: file='%s'", file_path)
+        mgr = NotebookManager(file_path)
+        return mgr.execute_all_cells(timeout=timeout, stop_on_error=stop_on_error)
+    except NotebookManagerError as e:
+        logger.warning("execute_all_cells: %s", e)
+        return f"Cannot execute all cells: {e}"
+    except Exception as e:
+        logger.exception("execute_all_cells crashed")
+        return f"Internal error in execute_all_cells: {type(e).__name__}: {e}"
+
+
+@mcp.tool(annotations=_READ_ONLY)
+def get_kernel_state(file_path: FilePath) -> str:
+    """
+    Return the current state of the notebook's Jupyter kernel (named by
+    metadata.kernelspec.name): 'not started', 'alive', or 'dead'. Does not start
+    a kernel if none exists.
+
+    Use this when: You want to check whether the notebook has an active kernel
+    before executing anything.
+
+    Example:
+        file_path="/abs/path/to/notebook.ipynb"
+    """
+    if err := _validate_file(file_path):
+        return err
+    try:
+        from notebook_editor import kernel as _kernel
+        state = _kernel.kernel_state(file_path)
+        logger.info("get_kernel_state: file='%s' state=%s", file_path, state)
+        return f"Kernel state for {file_path}: {state}"
+    except Exception as e:
+        logger.exception("get_kernel_state crashed")
+        return f"Internal error in get_kernel_state: {type(e).__name__}: {e}"
+
+
+@mcp.tool(annotations=_DESTRUCTIVE)
+def restart_kernel(file_path: FilePath) -> str:
+    """
+    Restart the notebook's Jupyter kernel (named by metadata.kernelspec.name).
+    All in-memory state (imports, variables, defined functions) is lost. Outputs
+    in the notebook file are preserved -- they are only cleared if you
+    subsequently re-execute. The restarted kernel keeps the notebook's folder as
+    its working directory. A cell that is running is not waited for: the kernel
+    is killed, and that execute call fails with "Kernel died during execution".
+    Execute calls waiting behind it run afterwards, on the restarted kernel.
+
+    Use this when: The kernel is in a bad state, or you want to start from a
+    clean namespace without re-running all cells.
+
+    Example:
+        file_path="/abs/path/to/notebook.ipynb"
+    """
+    if err := _validate_file(file_path):
+        return err
+    from notebook_editor import kernel as _kernel
+    try:
+        logger.info("restart_kernel: file='%s'", file_path)
+        if _kernel.get_kernel(file_path) is None:
+            return "Skipped (no kernel running)"
+        _kernel.restart_kernel(file_path)
+        return "Restarted"
+    except _kernel.KernelError as e:
+        logger.warning("restart_kernel: %s", e)
+        return f"Cannot restart kernel: {e}"
+    except Exception as e:
+        logger.exception("restart_kernel crashed")
+        return f"Internal error in restart_kernel: {type(e).__name__}: {e}"
+
+
+@mcp.tool(annotations=_ADDITIVE)
+def interrupt_kernel(file_path: FilePath) -> str:
+    """
+    Send an interrupt (SIGINT, or an interrupt message if the kernelspec asks
+    for one; a KeyboardInterrupt in Python) to the notebook's Jupyter kernel
+    (named by metadata.kernelspec.name). Use this to stop a long-running or
+    stuck cell without restarting the kernel; it acts at once, even while an
+    execute call is waiting on that cell. Variable state in the kernel is
+    preserved. If the kernel process has died (get_kernel_state reports 'dead'),
+    returns an error saying the kernel is not running; the next execute_cell
+    starts a new one.
+
+    Use this when: A cell is taking too long, appears stuck in an infinite loop,
+    or you want to abort the current execution.
+
+    Example:
+        file_path="/abs/path/to/notebook.ipynb"
+    """
+    if err := _validate_file(file_path):
+        return err
+    from notebook_editor import kernel as _kernel
+    try:
+        logger.info("interrupt_kernel: file='%s'", file_path)
+        if _kernel.get_kernel(file_path) is None:
+            return "Skipped (no kernel running)"
+        _kernel.interrupt_kernel(file_path)
+        return "Interrupted"
+    except _kernel.KernelError as e:
+        logger.warning("interrupt_kernel: %s", e)
+        return f"Cannot interrupt kernel: {e}"
+    except Exception as e:
+        logger.exception("interrupt_kernel crashed")
+        return f"Internal error in interrupt_kernel: {type(e).__name__}: {e}"
+
+
+@mcp.tool(annotations=_DESTRUCTIVE)
+def shutdown_kernel(file_path: FilePath) -> str:
+    """
+    Shut down the notebook's Jupyter kernel (named by metadata.kernelspec.name).
+    Frees the process and releases resources. A new kernel will be started
+    automatically if you call `execute_cell` again. A cell that is running is not
+    waited for: the kernel is killed, and that execute call fails with "Kernel
+    died during execution"; execute calls waiting behind it fail with "Kernel was
+    shut down".
+
+    Use this when: You're done with a notebook and want to release kernel
+    resources, or you want a completely fresh start next time you execute.
+
+    Example:
+        file_path="/abs/path/to/notebook.ipynb"
+    """
+    if err := _validate_file(file_path):
+        return err
+    try:
+        from notebook_editor import kernel as _kernel
+        logger.info("shutdown_kernel: file='%s'", file_path)
+        if _kernel.get_kernel(file_path) is None:
+            return "Skipped (no kernel running)"
+        _kernel.shutdown_kernel(file_path)
+        return "Shut down"
+    except Exception as e:
+        logger.exception("shutdown_kernel crashed")
+        return f"Internal error in shutdown_kernel: {type(e).__name__}: {e}"
+
+
+@mcp.tool(annotations=_DESTRUCTIVE)
+def create_notebook(
+    file_path: Annotated[str, Field(description="Absolute path for the new .ipynb file; its parent directory must already exist.")],
+    kernel_name: Annotated[str, Field(description="Jupyter kernelspec name stored in metadata.kernelspec.name (for example 'python3' or 'ir'); must match an installed kernel for execution to work.")] = "python3",
+    kernel_display_name: Annotated[str, Field(description="Kernel name shown in the Jupyter UI; empty (default) uses kernel_name.")] = "",
+    language: Annotated[str, Field(description="Kernel language stored in metadata.kernelspec.language and language_info.name (for example 'python' or 'R').")] = "python",
+    overwrite: Annotated[bool, Field(description="Replace an existing file at file_path; false (default) refuses to overwrite.")] = False,
+) -> str:
+    """
+    Create a new empty .ipynb file with a valid nbformat schema and a kernelspec
+    wired up. Use this instead of writing notebook JSON by hand -- it guarantees
+    correct nbformat version, metadata structure, and cell list.
+
+    Use this when: You need to create a new Jupyter notebook at a specific path.
+    Don't use this when: The notebook already exists -- use add_cell/other edit
+    tools instead. Pass overwrite=True only if you explicitly intend to replace
+    an existing file.
+
+    Example:
+        file_path="/abs/path/to/new_notebook.ipynb"
+        # optional:
+        kernel_name="python3"                    # matches installed kernel
+        kernel_display_name="Python (my-venv)"   # shown in Jupyter UI
+        language="python"
+    """
+    if not os.path.isabs(file_path):
+        return f"file_path must be an absolute path, got: {file_path}"
+    if not file_path.endswith(".ipynb"):
+        return f"File is not a .ipynb notebook: {file_path}"
+    try:
+        logger.info("create_notebook: file='%s' kernel='%s'", file_path, kernel_name)
+        _create_notebook(
+            file_path,
+            kernel_name=kernel_name,
+            kernel_display_name=kernel_display_name or None,
+            language=language,
+            overwrite=overwrite,
+        )
+        return "Created"
+    except NotebookManagerError as e:
+        logger.warning("create_notebook: %s", e)
+        return f"Cannot create notebook: {e}"
+    except Exception as e:
+        logger.exception("create_notebook crashed")
+        return f"Internal error in create_notebook: {type(e).__name__}: {e}"
+
+
+def main():
+    logger.info("Starting Notebook Editor MCP server")
+    mcp.run(transport="stdio")
+
+
+if __name__ == "__main__":
+    main()
